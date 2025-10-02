@@ -1,0 +1,144 @@
+This is my router with public IP address: 4.194.179.219
+[admin@MikroTik] > /system resource print   
+                   uptime: 21s                                      
+                  version: 7.19.6 (stable)                          
+               build-time: 2025-09-12 09:02:42                      
+         factory-software: 7.1                                      
+              free-memory: 287.7MiB                                 
+             total-memory: 512.0MiB                                 
+                      cpu: Intel(R)                                 
+                cpu-count: 1                                        
+            cpu-frequency: 2294MHz                                  
+                 cpu-load: 1%                                       
+           free-hdd-space: 961.1MiB                                 
+          total-hdd-space: 980.0MiB                                 
+  write-sect-since-reboot: 728                                      
+         write-sect-total: 728                                      
+        architecture-name: x86_64                                   
+               board-name: CHR Microsoft Corporation Virtual Machine
+                 platform: MikroTik                                 
+   DST-ADDRESS         GATEWAY     ROUTING-TABLE  DISTANCE
+DAd 0.0.0.0/0           172.16.0.1  main                  1
+DAd 168.63.129.16/32    172.16.0.1  main                  1
+DAd 169.254.169.254/32  172.16.0.1  main                  1
+DAc 172.16.0.0/24       ether1      main                  0
+[admin@MikroTik] > 
+
+Azure VPN gateway: Public IP Address
+4.245.196.56
+I created a S2S VPN from local address Vlan 172.16.50.0/24 and 172.16.49.0/24 to Azure Vnet: 10.0.0.0/16 and 10.0.1.0/24
+
+
+# Interfaces
+/interface ethernet set [find default-name=ether1] disable-running-check=no
+/interface vlan add interface=ether1 name=vlan50 vlan-id=50
+/interface vlan add interface=ether1 name=vlan49 vlan-id=49
+/interface ethernet set ether1 mtu=1350
+/interface set vlan50 mtu=1350
+/interface set vlan49 mtu=1350
+
+# IP Addresses
+/ip address add address=172.16.51.1/32 interface=ether1 network=172.16.51.0
+/ip address add address=172.16.50.0/24 interface=vlan50 network=172.16.50.0
+/ip address add address=172.16.49.0/24 interface=vlan49 network=172.16.49.0
+
+
+
+# IPsec Configuration
+/ip ipsec policy group add name=azure-group
+/ip ipsec profile add dh-group=modp1024 dpd-interval=45s dpd-maximum-failures=5 enc-algorithm=aes-256 hash-algorithm=sha256 lifetime=8h name=azure-ike-profile nat-traversal=yes
+/ip ipsec proposal add auth-algorithms=sha256,sha1 enc-algorithms=aes-256-cbc,aes-256-ctr lifetime=7h name=azure-proposal pfs-group=none
+/ip ipsec peer add address=4.245.196.56/32 exchange-mode=ike2 local-address=0.0.0.0 name=azure-peer profile=azure-ike-profile
+/ip ipsec identity add generate-policy=port-strict peer=azure-peer secret=ekoc+VuJsOwWaGt2sKcM4umV4T/IFTWq
+/ip ipsec policy set 0 comment="IPSec Policy" dst-address=10.0.0.0/16 group=azure-group proposal=azure-proposal src-address=172.16.50.0/24
+/ip ipsec policy add dst-address=10.0.0.0/16 peer=azure-peer proposal=azure-proposal src-address=172.16.50.0/24 tunnel=yes  
+/ip ipsec policy add dst-address=10.0.0.0/16 peer=azure-peer proposal=azure-proposal src-address=172.16.49.0/24 tunnel=yes
+
+ 
+# Firewall
+/ip firewall filter
+add action=accept chain=input protocol=udp in-interface=ether1 dst-port=500,4500
+add action=accept chain=input protocol=ipsec-esp in-interface=ether1
+add action=accept chain=input in-interface=ether1 ipsec-policy=in,ipsec
+add action=accept chain=forward src-address=172.16.50.0/24 dst-address=10.0.0.0/16
+add action=accept chain=forward src-address=172.16.49.0/24 dst-address=10.0.0.0/16
+add action=accept chain=forward src-address=10.0.0.0/16 dst-address=172.16.50.0/24
+add action=accept chain=forward src-address=10.0.0.0/16 dst-address=172.16.49.0/24
+add action=accept chain=forward connection-state=established,related
+add action=accept chain=output src-address=172.16.50.0 dst-address=10.0.0.0/16
+add action=accept chain=output src-address=172.16.49.0 dst-address=10.0.0.0/16
+
+# NAT
+/ip firewall nat
+add action=accept chain=srcnat src-address=172.16.50.0/24 dst-address=10.0.0.0/16 place-before=0
+add action=accept chain=srcnat src-address=172.16.49.0/24 dst-address=10.0.0.0/16 place-before=0
+add action=dst-nat chain=dstnat protocol=udp dst-address=4.194.179.219 dst-port=500,4500 to-addresses=172.16.51.1
+add action=src-nat chain=srcnat src-address=172.16.51.1 to-addresses=4.194.179.219
+add action=src-nat chain=srcnat src-address=172.16.51.1 dst-address=10.0.0.0/16 to-addresses=172.16.50.1
+add action=src-nat chain=srcnat src-address=172.16.51.1 dst-address=10.0.0.0/16 to-addresses=172.16.49.1
+add action=masquerade chain=srcnat out-interface=ether1
+
+# Routes
+/ip route add dst-address=0.0.0.0/0 gateway=172.16.51.1
+/ip route add distance=1 dst-address=10.0.0.0/16 gateway=4.245.196.56
+/ip route add distance=1 dst-address=10.0.1.0/24 gateway=4.245.196.56
+
+# Secure Services
+/ip service
+set ftp disabled=yes
+set ssh disabled=yes
+set telnet disabled=yes
+set www disabled=yes
+set api disabled=yes
+set api-ssl disabled=yes
+
+
+ping src-address=172.16.49.0 10.0.1.4 
+ping interface=vlan49 10.0.1.4
+
+[admin@MikroTik] > /ip route print   
+Flags: D - DYNAMIC; I - INACTIVE, A - ACTIVE; c - CONNECT, s - STATIC, d - DHCP
+Columns: DST-ADDRESS, GATEWAY, ROUTING-TABLE, DISTANCE
+#     DST-ADDRESS         GATEWAY       ROUTING-TABLE  DISTANCE
+  DAd 0.0.0.0/0           172.16.0.1    main                  1
+0  Is 10.0.0.0/16         4.245.196.56  main                  1
+  DAd 168.63.129.16/32    172.16.0.1    main                  1
+  DAd 169.254.169.254/32  172.16.0.1    main                  1
+  DAc 172.16.0.0/24       ether1        main                  0
+  DAc 172.16.49.0/24      vlan49        main                  0
+  DAc 172.16.50.0/24      vlan50        main                  0
+  DAc 172.16.51.0/32      ether1        main                  0
+[admin@MikroTik] > /ip firewall filter print
+Flags: X - disabled, I - invalid; D - dynamic 
+ 0    chain=input action=accept protocol=udp in-interface=ether1 dst-port=500,4500 
+
+ 1    chain=input action=accept protocol=ipsec-esp in-interface=ether1 
+
+ 2    chain=input action=accept in-interface=ether1 ipsec-policy=in,ipsec 
+
+ 3    chain=forward action=accept src-address=172.16.50.0/24 dst-address=10.0.0.0/16 
+
+ 4    chain=forward action=accept src-address=172.16.49.0/24 dst-address=10.0.0.0/16 
+
+ 5    chain=forward action=accept src-address=10.0.0.0/16 dst-address=172.16.50.0/24 
+
+ 6    chain=forward action=accept src-address=10.0.0.0/16 dst-address=172.16.49.0/24 
+
+ 7    chain=forward action=accept connection-state=established,related 
+
+ 8    chain=forward action=accept protocol=icmp 
+
+ 9    chain=forward action=accept src-address=172.16.50.0/24 dst-address=10.0.1.0/24 
+
+10    chain=forward action=accept protocol=icmp src-address=172.16.49.0/24 dst-address=10.0.1.4 
+
+11    chain=forward action=accept protocol=icmp src-address=172.16.50.0/24 dst-address=10.0.1.4 
+[admin@MikroTik] > /ip firewall nat print
+Flags: X - disabled, I - invalid; D - dynamic 
+ 0    chain=srcnat action=accept src-address=172.16.49.0/24 dst-address=10.0.0.0/16 
+
+ 1    chain=srcnat action=accept src-address=172.16.50.0/24 dst-address=10.0.0.0/16 
+
+ 2    chain=srcnat action=masquerade out-interface=ether1 
+[admin@MikroTik] > 
+
