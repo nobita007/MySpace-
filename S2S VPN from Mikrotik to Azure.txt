@@ -142,3 +142,4 @@ Flags: X - disabled, I - invalid; D - dynamic
  2    chain=srcnat action=masquerade out-interface=ether1 
 [admin@MikroTik] > 
 
+
