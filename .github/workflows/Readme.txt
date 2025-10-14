@@ -39,6 +39,19 @@ Azure SQL credentials (lines 23-25)
 Azure Storage account details (lines 28-30)
 Optionally adjust the 180-day threshold
 
+Test Connection First
+# Test SQL connection
+$conn = New-Object System.Data.SqlClient.SqlConnection
+$conn.ConnectionString = "Server=tcp:demoarchetype.database.windows.net,1433;Database=demo;User ID=archetype;Password=ndnts1!Cdnch;Encrypt=True;"
+$conn.Open()
+$conn.State  # Should show "Open"
+$conn.Close()
+
+# Test Storage connection
+Import-Module Az.Storage
+$ctx = New-AzStorageContext -StorageAccountName "serverlesscodeb721" -StorageAccountKey "8BaUlhfQYl5WY5OLf1yRXcrnCQCt5r/Tl1tqE+pZw+qtF20iH216OCgOnVz07CMxzqVjiHMaDX1e+AStAleg1Q=="
+Get-AzStorageContainer -Context $ctx  # Should list containers
+
 Prerequisites
 powershell# Install required module
 Install-Module -Name Az.Storage -Scope CurrentUser
@@ -47,3 +60,4 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 Usage
 
 powershell.\FileAuditArchive.ps1
+
