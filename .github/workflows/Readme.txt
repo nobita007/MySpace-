@@ -42,5 +42,8 @@ Optionally adjust the 180-day threshold
 Prerequisites
 powershell# Install required module
 Install-Module -Name Az.Storage -Scope CurrentUser
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
 Usage
+
 powershell.\FileAuditArchive.ps1
