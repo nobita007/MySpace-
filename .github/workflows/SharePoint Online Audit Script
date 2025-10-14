@@ -1,0 +1,8 @@
+# Connect to SharePoint Online
+Connect-PnPOnline -Url "https://earthwanderer.sharepoint.com/sites/DemoSite" -Interactive
+
+# Get recent changes in the Documents library
+$items = Get-PnPListItem -List "Documents" -Fields "Modified", "Editor", "FileLeafRef" | Sort-Object Modified -Descending
+
+# Display audit-like info
+$items | Select-Object FileLeafRef, Modified, @{Name="ModifiedBy";Expression={$_.FieldValues["Editor"].LookupValue}} | Format-Table -AutoSize
