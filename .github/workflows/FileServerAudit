@@ -1,3 +1,7 @@
+# ============================================================================
+# MAIN PROCESSING FUNCTION
+# ============================================================================
+
 function Process-FileServerAudit {
     # Validate UNC path
     if (-not (Test-Path $UNCPath)) {
@@ -18,41 +22,219 @@ function Process-FileServerAudit {
         $storageContext = $null
     }
     
-    # PHASE 1: Build folder structure
-    Write-Log "========================================" -Level INFO
-    Write-Log "PHASE 1: Building Folder Structure" -Level INFO
-    Write-Log "========================================" -Level INFO
+    # Build folder structure map
+    Write-Log "Building folder structure map..." -Level INFO
+    $folderMap = @{}
     
-    $folders = Get-ChildItem -Path $UNCPath -Recurse -Directory -ErrorAction SilentlyContinue
-    $allFolders = @($UNCPath) + $folders.FullName
-    $folderCount = $allFolders.Count
-    $folderIndex = 0
-    $folderIdMap = @{}
+    # Get all folders
+    Write-Log "Scanning folder structure: $UNCPath" -Level INFO
+    $folders = @(Get-Item -Path $UNCPath) + @(Get-ChildItem -Path $UNCPath -Recurse -Directory -ErrorAction SilentlyContinue)
+    $totalFolders = $folders.Count
+    Write-Log "Found $totalFolders folders to process" -Level INFO
     
-    Write-Log "Found $folderCount folders to process" -Level INFO
-    
-    foreach ($folderPath in $allFolders) {
-        $folderIndex++
+    $folderCount = 0
+    foreach ($folder in $folders) {
+        $folderCount++
         
         try {
-            $folderItem = Get-Item -Path $folderPath -ErrorAction Stop
-            $folderName = $folderItem.Name
-            if ([string]::IsNullOrEmpty($folderName)) { $folderName = "Root" }
-            
             # Calculate folder level
-            $relativePath = $folderPath.Replace($UNCPath, "").Trim('\')
-            $folderLevel = if ([string]::IsNullOrEmpty($relativePath)) { 0 } else { ($relativePath.Split('\').Count) }
+            $relativePath = $folder.FullName.Replace($UNCPath, "").TrimStart('\')
+            $level = if ($relativePath -eq "") { 0 } else { ($relativePath.Split('\').Count) }
             
-            # Get parent folder
-            $parentFolder = if ($folderLevel -gt 0) { $folderItem.Parent.FullName } else { $null }
+            # Get parent path
+            $parentPath = if ($folder.Parent) { $folder.Parent.FullName } else { $null }
             
-            # Get folder metadata
-            $owner = Get-FileOwner -Path $folderPath
-            
-            Write-Log "[$folderIndex/$folderCount] Processing folder: $folderName (Level $folderLevel)" -Level INFO
+            Write-Log "[$folderCount/$totalFolders] Processing folder: $($folder.Name) (Level: $level)" -Level INFO
             
             # Insert folder structure
-            $folderId = Add-FolderStructureRecord -Connection $sqlConnection `#Requires -Version 5.1
+            $folderId = Add-FolderStructureRecord -Connection $sqlConnection -FolderInfo $folder -ParentPath $parentPath -Level $level
+            
+            if ($folderId) {
+                # Store in map for later reference
+                $folderMap[$folder.FullName] = $folderId
+                
+                # Get and store folder permissions
+                $folderPermissions = Get-FolderPermissions -Path $folder.FullName
+                Add-FolderPermissionRecords -Connection $sqlConnection -FolderStructureId $folderId -Permissions $folderPermissions
+                
+                Write-Log "  -> Folder ID: $folderId, Permissions: $($folderPermissions.Count)" -Level INFO
+            }
+        }
+        catch {
+            Write-Log "Error processing folder $($folder.FullName): $($_.Exception.Message)" -Level ERROR
+        }
+    }
+    
+    Write-Log "Folder structure mapping complete" -Level SUCCESS
+    
+    # Get all files
+    Write-Log "Scanning files in: $UNCPath" -Level INFO
+    $files = Get-ChildItem -Path $UNCPath -Recurse -File -ErrorAction SilentlyContinue
+    $totalFiles = $files.Count
+    Write-Log "Found $totalFiles files to process" -Level INFO
+    
+    $processedCount = 0
+    $archivedCount = 0
+    $errorCount = 0
+    $currentDate = Get-Date
+    
+    foreach ($file in $files) {
+        $processedCount++
+        
+        try {
+            # Calculate days since last access and modification
+            $daysSinceAccess = ($currentDate - $file.LastAccessTime).Days
+            $daysSinceModified = ($currentDate - $file.LastWriteTime).Days
+            
+            # Get folder ID from map
+            $folderId = $folderMap[$file.DirectoryName]
+            
+            # Determine status
+            if ($daysSinceAccess -le $InactiveDaysThreshold) {
+                $status = "Active"
+                $isArchived = $false
+                $archiveURL = $null
+                $checksum = $null
+                
+                Write-Log "[$processedCount/$totalFiles] Processing (Active): $($file.Name) - Last accessed: $daysSinceAccess days ago" -Level INFO
+                
+                # Insert into database
+                $fileAuditId = Add-FileAuditRecord -Connection $sqlConnection -FileInfo $file -Status $status -FolderStructureId $folderId -IsArchived $isArchived -ArchiveURL $archiveURL -Checksum $checksum -DaysSinceAccess $daysSinceAccess -DaysSinceModified $daysSinceModified
+                
+                if ($fileAuditId) {
+                    # Add file permissions
+                    $permissions = Get-FilePermissions -Path $file.FullName
+                    Add-FilePermissionRecords -Connection $sqlConnection -FileAuditId $fileAuditId -Permissions $permissions
+                    
+                    # Display permission summary
+                    $writeUsers = ($permissions | Where-Object { $_.CanWrite -or $_.CanModify -or $_.FullControl }).Identity -join ", "
+                    if ($writeUsers) {
+                        Write-Log "  -> Owner: $(Get-FileOwner -Path $file.FullName)" -Level INFO
+                        Write-Log "  -> Users with write/edit access: $writeUsers" -Level INFO
+                    }
+                }
+            }
+            else {
+                # File is inactive - archive it
+                Write-Log "[$processedCount/$totalFiles] Processing (Inactive - Archiving): $($file.Name) - Last accessed: $daysSinceAccess days ago" -Level WARNING
+                
+                # Calculate checksum before archiving
+                $checksum = Get-FileChecksum -Path $file.FullName
+                
+                if ($storageContext) {
+                    # Upload to Azure Storage
+                    $archiveURL = Copy-ToAzureStorage -FilePath $file.FullName -StorageContext $storageContext
+                    
+                    if ($archiveURL) {
+                        # Verify checksum
+                        $checksumMatch = Verify-ArchiveChecksum -OriginalChecksum $checksum -BlobUrl $archiveURL -StorageContext $storageContext
+                        
+                        if ($checksumMatch) {
+                            $status = "Archived"
+                            $isArchived = $true
+                            
+                            # Insert into database
+                            $fileAuditId = Add-FileAuditRecord -Connection $sqlConnection -FileInfo $file -Status $status -FolderStructureId $folderId -IsArchived $isArchived -ArchiveURL $archiveURL -Checksum $checksum -DaysSinceAccess $daysSinceAccess -DaysSinceModified $daysSinceModified
+                            
+                            if ($fileAuditId) {
+                                # Add permissions before deletion
+                                $permissions = Get-FilePermissions -Path $file.FullName
+                                Add-FilePermissionRecords -Connection $sqlConnection -FileAuditId $fileAuditId -Permissions $permissions
+                                
+                                # Delete original file
+                                Remove-Item -Path $file.FullName -Force
+                                Write-Log "  -> Successfully archived and deleted. Archive URL: $archiveURL" -Level SUCCESS
+                                $archivedCount++
+                            }
+                        }
+                        else {
+                            Write-Log "  -> Checksum mismatch - File NOT deleted" -Level ERROR
+                            $errorCount++
+                        }
+                    }
+                    else {
+                        Write-Log "  -> Failed to upload - File NOT deleted" -Level ERROR
+                        $errorCount++
+                    }
+                }
+                else {
+                    # No storage context - just mark as inactive
+                    $status = "Inactive"
+                    $isArchived = $false
+                    $archiveURL = $null
+                    
+                    $fileAuditId = Add-FileAuditRecord -Connection $sqlConnection -FileInfo $file -Status $status -FolderStructureId $folderId -IsArchived $isArchived -ArchiveURL $archiveURL -Checksum $checksum -DaysSinceAccess $daysSinceAccess -DaysSinceModified $daysSinceModified
+                    
+                    if ($fileAuditId) {
+                        $permissions = Get-FilePermissions -Path $file.FullName
+                        Add-FilePermissionRecords -Connection $sqlConnection -FileAuditId $fileAuditId -Permissions $permissions
+                    }
+                }
+            }
+            
+            # Progress indicator
+            if ($processedCount % 50 -eq 0) {
+                $percentComplete = [math]::Round(($processedCount / $totalFiles) * 100, 2)
+                Write-Log "Progress: $processedCount/$totalFiles files processed ($percentComplete%)" -Level INFO
+            }
+        }
+        catch {
+            Write-Log "Error processing file $($file.FullName): $($_.Exception.Message)" -Level ERROR
+            $errorCount++
+        }
+    }
+    
+    # Update folder statistics
+    Write-Log "Updating folder statistics..." -Level INFO
+    foreach ($folderPath in $folderMap.Keys) {
+        try {
+            $folderId = $folderMap[$folderPath]
+            
+            # Count files in this folder
+            $filesInFolder = Get-ChildItem -Path $folderPath -File -ErrorAction SilentlyContinue
+            $fileCount = $filesInFolder.Count
+            $totalSize = ($filesInFolder | Measure-Object -Property Length -Sum).Sum
+            
+            # Count immediate subfolders
+            $subfolders = Get-ChildItem -Path $folderPath -Directory -ErrorAction SilentlyContinue
+            $subfolderCount = $subfolders.Count
+            
+            Update-FolderStatistics -Connection $sqlConnection -FolderId $folderId -FileCount $fileCount -SubfolderCount $subfolderCount -TotalSize $totalSize
+        }
+        catch {
+            Write-Log "Error updating folder statistics for $folderPath : $($_.Exception.Message)" -Level WARNING
+        }
+    }
+    
+    # Close database connection
+    $sqlConnection.Close()
+    
+    # Summary
+    Write-Log "========================================" -Level INFO
+    Write-Log "Audit Complete" -Level SUCCESS
+    Write-Log "========================================" -Level INFO
+    Write-Log "Total Folders Processed: $totalFolders" -Level INFO
+    Write-Log "Total Files Processed: $processedCount" -Level INFO
+    Write-Log "Files Archived: $archivedCount" -Level INFO
+    Write-Log "Errors: $errorCount" -Level INFO
+    Write-Log "Log file: $LogFile" -Level INFO
+    Write-Log "========================================" -Level INFO
+    
+    # Database summary query
+    Write-Log "" -Level INFO
+    Write-Log "Database Summary:" -Level INFO
+    Write-Log "- Query FolderStructure table to see folder hierarchy" -Level INFO
+    Write-Log "- Query FileAudit table to see all file details" -Level INFO
+    Write-Log "- Query FilePermissions table to see who can access/edit files" -Level INFO
+    Write-Log "- Query FolderPermissions table to see folder access rights" -Level INFO
+    Write-Log "" -Level INFO
+    Write-Log "Example queries:" -Level INFO
+    Write-Log "  -- Find all users who can edit files:" -Level INFO
+    Write-Log "  SELECT DISTINCT IdentityReference FROM FilePermissions WHERE CanWrite = 1 OR CanModify = 1" -Level INFO
+    Write-Log "" -Level INFO
+    Write-Log "  -- Find files not accessed in 180+ days:" -Level INFO
+    Write-Log "  SELECT FileName, LastAccessTime, DaysSinceLastAccess, Owner FROM FileAudit WHERE DaysSinceLastAccess > 180" -Level INFO
+}#Requires -Version 5.1
 <#
 .SYNOPSIS
     Audit and archive file server data with Azure SQL Database tracking
@@ -150,19 +332,20 @@ BEGIN
         Id INT IDENTITY(1,1) PRIMARY KEY,
         FolderPath NVARCHAR(MAX) NOT NULL,
         FolderName NVARCHAR(500) NOT NULL,
-        ParentFolder NVARCHAR(MAX),
+        ParentFolderPath NVARCHAR(MAX),
         FolderLevel INT,
-        Owner NVARCHAR(500),
         CreationTime DATETIME2,
         LastModifiedTime DATETIME2,
         LastAccessTime DATETIME2,
+        Owner NVARCHAR(500),
         TotalFiles INT DEFAULT 0,
-        TotalSizeMB DECIMAL(18,2) DEFAULT 0,
+        TotalSubfolders INT DEFAULT 0,
+        TotalSizeBytes BIGINT DEFAULT 0,
         AuditDate DATETIME2 DEFAULT GETDATE()
     );
     
-    CREATE NONCLUSTERED INDEX IX_FolderStructure_ParentFolder ON FolderStructure(ParentFolder);
-    CREATE NONCLUSTERED INDEX IX_FolderStructure_FolderLevel ON FolderStructure(FolderLevel);
+    CREATE NONCLUSTERED INDEX IX_FolderStructure_FolderPath ON FolderStructure(FolderPath);
+    CREATE NONCLUSTERED INDEX IX_FolderStructure_ParentFolderPath ON FolderStructure(ParentFolderPath);
 END
 
 IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'FileAudit')
@@ -197,6 +380,7 @@ BEGIN
     CREATE NONCLUSTERED INDEX IX_FileAudit_LastAccessTime ON FileAudit(LastAccessTime);
     CREATE NONCLUSTERED INDEX IX_FileAudit_LastModifiedTime ON FileAudit(LastModifiedTime);
     CREATE NONCLUSTERED INDEX IX_FileAudit_FolderStructureId ON FileAudit(FolderStructureId);
+    CREATE NONCLUSTERED INDEX IX_FileAudit_Owner ON FileAudit(Owner);
 END
 
 IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'FilePermissions')
@@ -205,22 +389,22 @@ BEGIN
         Id INT IDENTITY(1,1) PRIMARY KEY,
         FileAuditId INT,
         IdentityReference NVARCHAR(500),
-        UserName NVARCHAR(500),
+        UserDisplayName NVARCHAR(500),
         AccessRights NVARCHAR(500),
+        AccessControlType NVARCHAR(50),
+        IsInherited BIT,
         CanRead BIT DEFAULT 0,
         CanWrite BIT DEFAULT 0,
         CanModify BIT DEFAULT 0,
         CanDelete BIT DEFAULT 0,
         CanExecute BIT DEFAULT 0,
         FullControl BIT DEFAULT 0,
-        AccessControlType NVARCHAR(50),
-        IsInherited BIT,
         AuditDate DATETIME2 DEFAULT GETDATE(),
         FOREIGN KEY (FileAuditId) REFERENCES FileAudit(Id)
     );
     
     CREATE NONCLUSTERED INDEX IX_FilePermissions_FileAuditId ON FilePermissions(FileAuditId);
-    CREATE NONCLUSTERED INDEX IX_FilePermissions_UserName ON FilePermissions(UserName);
+    CREATE NONCLUSTERED INDEX IX_FilePermissions_Identity ON FilePermissions(IdentityReference);
     CREATE NONCLUSTERED INDEX IX_FilePermissions_CanWrite ON FilePermissions(CanWrite);
     CREATE NONCLUSTERED INDEX IX_FilePermissions_CanModify ON FilePermissions(CanModify);
 END
@@ -231,21 +415,21 @@ BEGIN
         Id INT IDENTITY(1,1) PRIMARY KEY,
         FolderStructureId INT,
         IdentityReference NVARCHAR(500),
-        UserName NVARCHAR(500),
+        UserDisplayName NVARCHAR(500),
         AccessRights NVARCHAR(500),
+        AccessControlType NVARCHAR(50),
+        IsInherited BIT,
         CanRead BIT DEFAULT 0,
         CanWrite BIT DEFAULT 0,
         CanModify BIT DEFAULT 0,
         CanDelete BIT DEFAULT 0,
         FullControl BIT DEFAULT 0,
-        AccessControlType NVARCHAR(50),
-        IsInherited BIT,
         AuditDate DATETIME2 DEFAULT GETDATE(),
         FOREIGN KEY (FolderStructureId) REFERENCES FolderStructure(Id)
     );
     
     CREATE NONCLUSTERED INDEX IX_FolderPermissions_FolderStructureId ON FolderPermissions(FolderStructureId);
-    CREATE NONCLUSTERED INDEX IX_FolderPermissions_UserName ON FolderPermissions(UserName);
+    CREATE NONCLUSTERED INDEX IX_FolderPermissions_Identity ON FolderPermissions(IdentityReference);
 END
 "@
     
@@ -283,39 +467,19 @@ function Get-FilePermissions {
         $permissions = @()
         
         foreach ($access in $acl.Access) {
-            # Parse the rights to determine specific capabilities
             $rights = $access.FileSystemRights
-            
-            $canRead = $rights -band [System.Security.AccessControl.FileSystemRights]::Read
-            $canWrite = $rights -band [System.Security.AccessControl.FileSystemRights]::Write
-            $canModify = $rights -band [System.Security.AccessControl.FileSystemRights]::Modify
-            $canDelete = $rights -band [System.Security.AccessControl.FileSystemRights]::Delete
-            $canExecute = $rights -band [System.Security.AccessControl.FileSystemRights]::ExecuteFile
-            $fullControl = $rights -band [System.Security.AccessControl.FileSystemRights]::FullControl
-            
-            # Try to resolve identity to username
-            $userName = $access.IdentityReference.Value
-            try {
-                $sid = $access.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
-                $ntAccount = $sid.Translate([System.Security.Principal.NTAccount])
-                $userName = $ntAccount.Value
-            }
-            catch {
-                # Keep the original identity if translation fails
-            }
             
             $permissions += [PSCustomObject]@{
                 Identity = $access.IdentityReference.Value
-                UserName = $userName
-                Rights = $access.FileSystemRights.ToString()
-                CanRead = [bool]$canRead
-                CanWrite = [bool]$canWrite
-                CanModify = [bool]$canModify
-                CanDelete = [bool]$canDelete
-                CanExecute = [bool]$canExecute
-                FullControl = [bool]$fullControl
+                Rights = $rights.ToString()
                 Type = $access.AccessControlType.ToString()
                 IsInherited = $access.IsInherited
+                CanRead = ($rights -band [System.Security.AccessControl.FileSystemRights]::Read) -ne 0
+                CanWrite = ($rights -band [System.Security.AccessControl.FileSystemRights]::Write) -ne 0
+                CanModify = ($rights -band [System.Security.AccessControl.FileSystemRights]::Modify) -ne 0
+                CanDelete = ($rights -band [System.Security.AccessControl.FileSystemRights]::Delete) -ne 0
+                CanExecute = ($rights -band [System.Security.AccessControl.FileSystemRights]::ExecuteFile) -ne 0
+                FullControl = ($rights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne 0
             }
         }
         
@@ -323,6 +487,36 @@ function Get-FilePermissions {
     }
     catch {
         Write-Log "Failed to get permissions for $Path : $($_.Exception.Message)" -Level WARNING
+        return @()
+    }
+}
+
+function Get-FolderPermissions {
+    param([string]$Path)
+    try {
+        $acl = Get-Acl -Path $Path -ErrorAction Stop
+        $permissions = @()
+        
+        foreach ($access in $acl.Access) {
+            $rights = $access.FileSystemRights
+            
+            $permissions += [PSCustomObject]@{
+                Identity = $access.IdentityReference.Value
+                Rights = $rights.ToString()
+                Type = $access.AccessControlType.ToString()
+                IsInherited = $access.IsInherited
+                CanRead = ($rights -band [System.Security.AccessControl.FileSystemRights]::Read) -ne 0
+                CanWrite = ($rights -band [System.Security.AccessControl.FileSystemRights]::Write) -ne 0
+                CanModify = ($rights -band [System.Security.AccessControl.FileSystemRights]::Modify) -ne 0
+                CanDelete = ($rights -band [System.Security.AccessControl.FileSystemRights]::Delete) -ne 0
+                FullControl = ($rights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne 0
+            }
+        }
+        
+        return $permissions
+    }
+    catch {
+        Write-Log "Failed to get permissions for folder $Path : $($_.Exception.Message)" -Level WARNING
         return @()
     }
 }
@@ -425,53 +619,41 @@ function Verify-ArchiveChecksum {
 function Add-FolderStructureRecord {
     param(
         [System.Data.SqlClient.SqlConnection]$Connection,
-        [string]$FolderPath,
-        [string]$FolderName,
-        [string]$ParentFolder,
-        [int]$FolderLevel,
-        [string]$Owner,
-        [DateTime]$CreationTime,
-        [DateTime]$LastModifiedTime,
-        [DateTime]$LastAccessTime
+        [object]$FolderInfo,
+        [string]$ParentPath,
+        [int]$Level
     )
     
     $query = @"
-IF NOT EXISTS (SELECT 1 FROM FolderStructure WHERE FolderPath = @FolderPath)
-BEGIN
-    INSERT INTO FolderStructure (
-        FolderPath, FolderName, ParentFolder, FolderLevel, Owner,
-        CreationTime, LastModifiedTime, LastAccessTime
-    )
-    VALUES (
-        @FolderPath, @FolderName, @ParentFolder, @FolderLevel, @Owner,
-        @CreationTime, @LastModifiedTime, @LastAccessTime
-    );
-    SELECT CAST(SCOPE_IDENTITY() AS INT);
-END
-ELSE
-BEGIN
-    SELECT Id FROM FolderStructure WHERE FolderPath = @FolderPath;
-END
+INSERT INTO FolderStructure (
+    FolderPath, FolderName, ParentFolderPath, FolderLevel,
+    CreationTime, LastModifiedTime, LastAccessTime, Owner
+)
+VALUES (
+    @FolderPath, @FolderName, @ParentPath, @Level,
+    @CreationTime, @LastModifiedTime, @LastAccessTime, @Owner
+);
+SELECT CAST(SCOPE_IDENTITY() AS INT);
 "@
     
     try {
         $command = $Connection.CreateCommand()
         $command.CommandText = $query
         
-        $command.Parameters.AddWithValue("@FolderPath", $FolderPath) | Out-Null
-        $command.Parameters.AddWithValue("@FolderName", $FolderName) | Out-Null
+        $command.Parameters.AddWithValue("@FolderPath", $FolderInfo.FullName) | Out-Null
+        $command.Parameters.AddWithValue("@FolderName", $FolderInfo.Name) | Out-Null
         
-        if ($ParentFolder) {
-            $command.Parameters.AddWithValue("@ParentFolder", $ParentFolder) | Out-Null
+        if ($ParentPath) {
+            $command.Parameters.AddWithValue("@ParentPath", $ParentPath) | Out-Null
         } else {
-            $command.Parameters.AddWithValue("@ParentFolder", [DBNull]::Value) | Out-Null
+            $command.Parameters.AddWithValue("@ParentPath", [DBNull]::Value) | Out-Null
         }
         
-        $command.Parameters.AddWithValue("@FolderLevel", $FolderLevel) | Out-Null
-        $command.Parameters.AddWithValue("@Owner", $Owner) | Out-Null
-        $command.Parameters.AddWithValue("@CreationTime", $CreationTime) | Out-Null
-        $command.Parameters.AddWithValue("@LastModifiedTime", $LastModifiedTime) | Out-Null
-        $command.Parameters.AddWithValue("@LastAccessTime", $LastAccessTime) | Out-Null
+        $command.Parameters.AddWithValue("@Level", $Level) | Out-Null
+        $command.Parameters.AddWithValue("@CreationTime", $FolderInfo.CreationTime) | Out-Null
+        $command.Parameters.AddWithValue("@LastModifiedTime", $FolderInfo.LastWriteTime) | Out-Null
+        $command.Parameters.AddWithValue("@LastAccessTime", $FolderInfo.LastAccessTime) | Out-Null
+        $command.Parameters.AddWithValue("@Owner", (Get-FileOwner -Path $FolderInfo.FullName)) | Out-Null
         
         $folderId = $command.ExecuteScalar()
         return $folderId
@@ -479,6 +661,39 @@ END
     catch {
         Write-Log "Failed to insert folder structure record: $($_.Exception.Message)" -Level ERROR
         return $null
+    }
+}
+
+function Update-FolderStatistics {
+    param(
+        [System.Data.SqlClient.SqlConnection]$Connection,
+        [int]$FolderId,
+        [int]$FileCount,
+        [int]$SubfolderCount,
+        [long]$TotalSize
+    )
+    
+    $query = @"
+UPDATE FolderStructure
+SET TotalFiles = @FileCount,
+    TotalSubfolders = @SubfolderCount,
+    TotalSizeBytes = @TotalSize
+WHERE Id = @FolderId;
+"@
+    
+    try {
+        $command = $Connection.CreateCommand()
+        $command.CommandText = $query
+        
+        $command.Parameters.AddWithValue("@FolderId", $FolderId) | Out-Null
+        $command.Parameters.AddWithValue("@FileCount", $FileCount) | Out-Null
+        $command.Parameters.AddWithValue("@SubfolderCount", $SubfolderCount) | Out-Null
+        $command.Parameters.AddWithValue("@TotalSize", $TotalSize) | Out-Null
+        
+        $command.ExecuteNonQuery() | Out-Null
+    }
+    catch {
+        Write-Log "Failed to update folder statistics: $($_.Exception.Message)" -Level WARNING
     }
 }
 
@@ -491,14 +706,12 @@ function Add-FolderPermissionRecords {
     
     $query = @"
 INSERT INTO FolderPermissions (
-    FolderStructureId, IdentityReference, UserName, AccessRights,
-    CanRead, CanWrite, CanModify, CanDelete, FullControl,
-    AccessControlType, IsInherited
+    FolderStructureId, IdentityReference, AccessRights, AccessControlType, 
+    IsInherited, CanRead, CanWrite, CanModify, CanDelete, FullControl
 )
 VALUES (
-    @FolderStructureId, @Identity, @UserName, @Rights,
-    @CanRead, @CanWrite, @CanModify, @CanDelete, @FullControl,
-    @Type, @IsInherited
+    @FolderStructureId, @Identity, @Rights, @Type, 
+    @IsInherited, @CanRead, @CanWrite, @CanModify, @CanDelete, @FullControl
 );
 "@
     
@@ -509,15 +722,14 @@ VALUES (
             
             $command.Parameters.AddWithValue("@FolderStructureId", $FolderStructureId) | Out-Null
             $command.Parameters.AddWithValue("@Identity", $perm.Identity) | Out-Null
-            $command.Parameters.AddWithValue("@UserName", $perm.UserName) | Out-Null
             $command.Parameters.AddWithValue("@Rights", $perm.Rights) | Out-Null
+            $command.Parameters.AddWithValue("@Type", $perm.Type) | Out-Null
+            $command.Parameters.AddWithValue("@IsInherited", $perm.IsInherited) | Out-Null
             $command.Parameters.AddWithValue("@CanRead", $perm.CanRead) | Out-Null
             $command.Parameters.AddWithValue("@CanWrite", $perm.CanWrite) | Out-Null
             $command.Parameters.AddWithValue("@CanModify", $perm.CanModify) | Out-Null
             $command.Parameters.AddWithValue("@CanDelete", $perm.CanDelete) | Out-Null
             $command.Parameters.AddWithValue("@FullControl", $perm.FullControl) | Out-Null
-            $command.Parameters.AddWithValue("@Type", $perm.Type) | Out-Null
-            $command.Parameters.AddWithValue("@IsInherited", $perm.IsInherited) | Out-Null
             
             $command.ExecuteNonQuery() | Out-Null
         }
@@ -531,8 +743,8 @@ function Add-FileAuditRecord {
     param(
         [System.Data.SqlClient.SqlConnection]$Connection,
         [object]$FileInfo,
-        [int]$FolderStructureId,
         [string]$Status,
+        [int]$FolderStructureId = $null,
         [bool]$IsArchived = $false,
         [string]$ArchiveURL = $null,
         [string]$Checksum = $null,
@@ -542,16 +754,14 @@ function Add-FileAuditRecord {
     
     $query = @"
 INSERT INTO FileAudit (
-    FilePath, FileName, FileExtension, FolderPath, FolderStructureId,
-    FileSizeBytes, FileSizeMB, CreationTime, LastModifiedTime, LastAccessTime,
-    Owner, Status, IsArchived, ArchiveDate, ArchiveURL, Checksum,
-    DaysSinceLastAccess, DaysSinceLastModified
+    FilePath, FileName, FileExtension, FolderPath, FolderStructureId, FileSizeBytes, FileSizeMB,
+    CreationTime, LastModifiedTime, LastAccessTime, Owner, Status, IsArchived,
+    ArchiveDate, ArchiveURL, Checksum, DaysSinceLastAccess, DaysSinceLastModified
 )
 VALUES (
-    @FilePath, @FileName, @FileExtension, @FolderPath, @FolderStructureId,
-    @FileSizeBytes, @FileSizeMB, @CreationTime, @LastModifiedTime, @LastAccessTime,
-    @Owner, @Status, @IsArchived, @ArchiveDate, @ArchiveURL, @Checksum,
-    @DaysSinceAccess, @DaysSinceModified
+    @FilePath, @FileName, @FileExtension, @FolderPath, @FolderStructureId, @FileSizeBytes, @FileSizeMB,
+    @CreationTime, @LastModifiedTime, @LastAccessTime, @Owner, @Status, @IsArchived,
+    @ArchiveDate, @ArchiveURL, @Checksum, @DaysSinceAccess, @DaysSinceModified
 );
 SELECT CAST(SCOPE_IDENTITY() AS INT);
 "@
@@ -619,14 +829,12 @@ function Add-FilePermissionRecords {
     
     $query = @"
 INSERT INTO FilePermissions (
-    FileAuditId, IdentityReference, UserName, AccessRights,
-    CanRead, CanWrite, CanModify, CanDelete, CanExecute, FullControl,
-    AccessControlType, IsInherited
+    FileAuditId, IdentityReference, AccessRights, AccessControlType, IsInherited,
+    CanRead, CanWrite, CanModify, CanDelete, CanExecute, FullControl
 )
 VALUES (
-    @FileAuditId, @Identity, @UserName, @Rights,
-    @CanRead, @CanWrite, @CanModify, @CanDelete, @CanExecute, @FullControl,
-    @Type, @IsInherited
+    @FileAuditId, @Identity, @Rights, @Type, @IsInherited,
+    @CanRead, @CanWrite, @CanModify, @CanDelete, @CanExecute, @FullControl
 );
 "@
     
@@ -637,16 +845,15 @@ VALUES (
             
             $command.Parameters.AddWithValue("@FileAuditId", $FileAuditId) | Out-Null
             $command.Parameters.AddWithValue("@Identity", $perm.Identity) | Out-Null
-            $command.Parameters.AddWithValue("@UserName", $perm.UserName) | Out-Null
             $command.Parameters.AddWithValue("@Rights", $perm.Rights) | Out-Null
+            $command.Parameters.AddWithValue("@Type", $perm.Type) | Out-Null
+            $command.Parameters.AddWithValue("@IsInherited", $perm.IsInherited) | Out-Null
             $command.Parameters.AddWithValue("@CanRead", $perm.CanRead) | Out-Null
             $command.Parameters.AddWithValue("@CanWrite", $perm.CanWrite) | Out-Null
             $command.Parameters.AddWithValue("@CanModify", $perm.CanModify) | Out-Null
             $command.Parameters.AddWithValue("@CanDelete", $perm.CanDelete) | Out-Null
             $command.Parameters.AddWithValue("@CanExecute", $perm.CanExecute) | Out-Null
             $command.Parameters.AddWithValue("@FullControl", $perm.FullControl) | Out-Null
-            $command.Parameters.AddWithValue("@Type", $perm.Type) | Out-Null
-            $command.Parameters.AddWithValue("@IsInherited", $perm.IsInherited) | Out-Null
             
             $command.ExecuteNonQuery() | Out-Null
         }
