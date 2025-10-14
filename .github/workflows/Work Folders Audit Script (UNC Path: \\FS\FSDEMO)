@@ -1,0 +1,16 @@
+# Define the UNC path
+$folderPath = "\\FS\FSDEMO"
+
+# Get current ACL
+$acl = Get-Acl $folderPath
+
+# Create audit rule for Everyone (you can specify a user or group)
+$auditRule = New-Object System.Security.AccessControl.FileSystemAuditRule(
+    "Everyone", "Read, Write", "None", "None", "Success, Failure"
+)
+
+# Add and apply the audit rule
+$acl.AddAuditRule($auditRule)
+Set-Acl -Path $folderPath -AclObject $acl
+
+Write-Host "Audit rule applied to $folderPath"
