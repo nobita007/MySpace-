@@ -19,14 +19,14 @@ $UNCPath = "\\FS\FSDEMO"
 $InactiveDaysThreshold = 180
 
 # Azure SQL Database Configuration
-$SqlServer = "archetypedemo.database.windows.net"
-$SqlDatabase = "Archetype Demo"
-$SqlUsername = "sqladmin" # Update with your username
-$SqlPassword = "YourPassword" # Update with your password or use Azure AD auth
+$SqlServer = "demoarchetype.database.windows.net"
+$SqlDatabase = "demo"
+$SqlUsername = "archetype"
+$SqlPassword = "ndnts1!Cdnch"
 
 # Azure Storage Configuration (for archived files)
-$StorageAccountName = "yourstorageaccount" # Update with your storage account
-$StorageAccountKey = "YourStorageKey" # Update with your storage key
+$StorageAccountName = "serverlesscodeb721"
+$StorageAccountKey = "8BaUlhfQYl5WY5OLf1yRXcrnCQCt5r/Tl1tqE+pZw+qtF20iH216OCgOnVz07CMxzqVjiHMaDX1e+AStAleg1Q=="
 $ArchiveContainerName = "archived-files"
 
 # Logging Configuration
