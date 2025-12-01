@@ -1,0 +1,35 @@
+# Validate tags before creation
+name: Tag Validation
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate tag format
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+
+          # Check semantic versioning format
+          if [[ ! $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+(\.[0-9]+)?)?$ ]]; then
+            echo "Invalid tag format: $TAG"
+            echo "Expected format: v1.2.3 or v1.2.3-alpha.1"
+            exit 1
+          fi
+
+          echo "Valid tag format: $TAG"
+
+      - name: Check for changelog entry
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+
+          if ! grep -q "$TAG" CHANGELOG.md; then
+            echo "No changelog entry found for $TAG"
+            exit 1
+          fi
+
+          echo "Changelog entry exists for $TAG"
