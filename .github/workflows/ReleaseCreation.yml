@@ -1,0 +1,58 @@
+name: Create GitHub Release
+
+on:
+  push:
+    tags:
+      - "v*" # Trigger on version tags
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get the previous tag for changelog generation
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || git rev-list --max-parents=0 HEAD)
+          CURRENT_TAG=${GITHUB_REF#refs/tags/}
+
+          # Generate changelog between tags
+          CHANGELOG=$(git log --pretty=format:"- %s (%an)" $PREVIOUS_TAG..$CURRENT_TAG)
+
+          # Save multiline output
+          {
+            echo 'changelog<<EOF'
+            echo "$CHANGELOG"
+            echo EOF
+          } >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          body: |
+            ## Changes in ${{ github.ref_name }}
+
+            ${{ steps.changelog.outputs.changelog }}
+
+            ## Installation
+
+            ### NPM
+            ```bash
+            npm install my-package@${{ github.ref_name }}
+            ```
+
+            ### Docker
+            ```bash
+            docker pull ghcr.io/myorg/myapp:${{ github.ref_name }}
+            ```
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
