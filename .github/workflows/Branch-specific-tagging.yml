@@ -1,0 +1,57 @@
+# Different tagging strategies for different branches
+name: Smart Tagging
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - "release/**"
+
+jobs:
+  create-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine tag strategy
+        id: strategy
+        run: |
+          BRANCH=${GITHUB_REF#refs/heads/}
+
+          case $BRANCH in
+            main)
+              TAG_PREFIX="v"
+              TAG_TYPE="stable"
+              ;;
+            develop)
+              TAG_PREFIX="dev-"
+              TAG_TYPE="development"
+              ;;
+            release/*)
+              TAG_PREFIX="rc-"
+              TAG_TYPE="release-candidate"
+              ;;
+            *)
+              echo "No tagging for branch: $BRANCH"
+              exit 0
+              ;;
+          esac
+
+          # Generate version based on date and commit
+          VERSION="${TAG_PREFIX}$(date +'%Y%m%d')-$(git rev-parse --short HEAD)"
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag-type=$TAG_TYPE" >> $GITHUB_OUTPUT
+
+      - name: Create tag
+        if: steps.strategy.outputs.version
+        run: |
+          git config user.name "Auto Tagger"
+          git config user.email "auto-tagger@company.com"
+
+          git tag -a "${{ steps.strategy.outputs.version }}" \
+            -m "${{ steps.strategy.outputs.tag-type }} build from ${GITHUB_SHA}"
+
+          git push origin "${{ steps.strategy.outputs.version }}"
